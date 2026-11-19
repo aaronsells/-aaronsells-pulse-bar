@@ -1,0 +1,10 @@
+{
+  "name": "pulse-bar",
+  "version": "0.1.0",
+  "description": "A live band above the prompt: what Claude is doing right now, session stats, and a tool-call sparkline.",
+  "author": {
+    "name": "aaronsells"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
