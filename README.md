@@ -1,3 +1,5 @@
+<img src=".claude-plugin/icon.png" alt="Pulse Bar icon" width="96" align="right">
+
 # Pulse Bar
 
 A Claude Code mod that adds a single live row just above the prompt, so you can see what Claude is doing at a glance:
