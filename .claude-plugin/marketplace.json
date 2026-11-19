@@ -1,0 +1,14 @@
+{
+  "name": "pulse-bar",
+  "description": "Pulse Bar: a live activity band for Claude Code.",
+  "owner": {
+    "name": "aaronsells"
+  },
+  "plugins": [
+    {
+      "name": "pulse-bar",
+      "source": "./",
+      "description": "A live band above the prompt: what Claude is doing right now, session stats, and a tool-call sparkline."
+    }
+  ]
+}
