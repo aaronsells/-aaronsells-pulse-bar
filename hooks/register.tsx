@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { Live, Stats } from '../types'
+import type { Lifetime, Live, Stats } from '../types'
 
 // ---------------------------------------------------------------------------
 // State: everything the band draws lives in $.state, so a hot reload keeps it.
@@ -28,6 +28,10 @@ const stats = atom({ plugin: 'pulse-bar', key: 'stats' } as const, EMPTY)
 const recent = atom({ plugin: 'pulse-bar', key: 'recent' } as const, [] as readonly number[])
 const now = atom({ plugin: 'pulse-bar', key: 'now' } as const, 0)
 const isExpanded = atom({ plugin: 'pulse-bar', key: 'isExpanded' } as const, false)
+const lifetime = atom({ plugin: 'pulse-bar', key: 'lifetime' } as const, { prompts: 0, toolCalls: 0, failures: 0, byTool: {}, since: 0 } as Lifetime)
+
+/** The $.store key lifetime totals persist under. */
+export const STORE_KEY = 'lifetime.v1'
 
 // ---------------------------------------------------------------------------
 // Pure helpers (exported for tests).
@@ -144,9 +148,80 @@ export function rasterCells(counts: readonly number[]): string {
   return base64(bytes)
 }
 
+/** Lifetime totals: what a session adds to them. */
+export type LifetimeDelta = { prompts?: number; toolCalls?: number; failures?: number; tool?: string }
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
+
+/** Reads a stored value back, or null when it is missing or not ours. */
+export function parseLifetime(v: unknown): Lifetime | null {
+  if (typeof v !== 'object' || v === null) return null
+  const o = v as Record<string, unknown>
+  if (!isCount(o.prompts) || !isCount(o.toolCalls) || !isCount(o.failures) || !isCount(o.since)) return null
+  if (typeof o.byTool !== 'object' || o.byTool === null) return null
+  const byTool: Record<string, number> = {}
+  for (const [k, n] of Object.entries(o.byTool as Record<string, unknown>)) {
+    if (isCount(n)) byTool[k] = n
+  }
+  return { prompts: o.prompts, toolCalls: o.toolCalls, failures: o.failures, byTool, since: o.since }
+}
+
+export function freshLifetime(at: number): Lifetime {
+  return { prompts: 0, toolCalls: 0, failures: 0, byTool: {}, since: at }
+}
+
+export function addLifetime(l: Lifetime, d: LifetimeDelta): Lifetime {
+  return {
+    ...l,
+    prompts: l.prompts + (d.prompts ?? 0),
+    toolCalls: l.toolCalls + (d.toolCalls ?? 0),
+    failures: l.failures + (d.failures ?? 0),
+    byTool: d.tool === undefined ? l.byTool : { ...l.byTool, [d.tool]: (l.byTool[d.tool] ?? 0) + 1 },
+  }
+}
+
+/** 1830 -> "1,830" without leaning on Intl. */
+export function grouped(n: number): string {
+  return String(Math.trunc(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+export function lifetimeText(l: Lifetime, limit = 3): string {
+  const d = new Date(l.since)
+  const since = l.since > 0 ? ` since ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}` : ''
+  const parts = [`${grouped(l.prompts)} prompts`, `${grouped(l.toolCalls)} tools`]
+  if (l.failures > 0) parts.push(`${grouped(l.failures)} ✗`)
+  const top = Object.entries(l.byTool)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([tool, n]) => `${tool} ${grouped(n)}`)
+  if (top.length > 0) parts.push(`top ${top.join(', ')}`)
+  return `Lifetime${since}: ${parts.join(' · ')}`
+}
+
 function withoutOne(list: readonly string[], item: string): string[] {
   const i = list.indexOf(item)
   return i < 0 ? [...list] : [...list.slice(0, i), ...list.slice(i + 1)]
+}
+
+// Lifetime writes re-read the store and add to it, one at a time, so parallel
+// tool calls in this session never overwrite each other's counts.
+let queue: Promise<unknown> = Promise.resolve()
+
+function serial<T>(fn: () => Promise<T>): Promise<T> {
+  const run = queue.then(fn)
+  queue = run.catch(() => undefined)
+  return run
+}
+
+async function bumpLifetime($: EngineInterface, d: LifetimeDelta): Promise<void> {
+  await serial(async () => {
+    const stored = parseLifetime(await $.store.get(STORE_KEY)) ?? freshLifetime(await $.clock.now())
+    const next = addLifetime(stored, d)
+    await $.store.set(STORE_KEY, next)
+    await update($, lifetime, () => next)
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +235,19 @@ export const register: Register = on => {
     await update($, stats, s => (s.startedAt > 0 ? s : { ...s, startedAt: t }))
     await update($, live, l => ({ ...IDLE, lastTurnSeconds: l.lastTurnSeconds }))
     await update($, now, () => t)
+
+    // Load lifetime totals from the store (first run: start counting now).
+    await serial(async () => {
+      const stored = parseLifetime(await $.store.get(STORE_KEY))
+      const value = stored ?? freshLifetime(t)
+      if (stored === null) await $.store.set(STORE_KEY, value)
+      await update($, lifetime, () => value)
+    })
+
+    await $.command.register({
+      name: 'pulse-reset',
+      description: 'Reset Pulse Bar lifetime totals and start counting again',
+    })
 
     // One tick a second moves the elapsed times and slides the sparkline.
     // Idle with an empty window, it writes nothing, so nothing redraws.
@@ -178,6 +266,7 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (!e.command) {
       await update($, stats, s => ({ ...s, prompts: s.prompts + 1 }))
+      await bumpLifetime($, { prompts: 1 })
     }
     return next(e)
   }).catch(($, e, next) => next(e)) // observe only: never block a prompt
@@ -219,9 +308,23 @@ export const register: Register = on => {
       return { ...l, active, toolStartedAt: null, phase: l.phase === 'idle' ? 'idle' : 'thinking' }
     })
     await update($, now, () => done)
+    await bumpLifetime($, { toolCalls: 1, failures: failed ? 1 : 0, tool: e.tool })
 
     return result
   }).catch(($, e, next) => next(e)) // observe only: a stats failure must not fail the tool
+
+  on('command.run', { command: 'pulse-reset' }, async $ => {
+    const before = await read($, lifetime)
+    const at = await $.clock.now()
+    await serial(async () => {
+      const value = freshLifetime(at)
+      await $.store.set(STORE_KEY, value)
+      await update($, lifetime, () => value)
+    })
+    return {
+      text: `Pulse Bar lifetime totals reset (were ${grouped(before.prompts)} prompts, ${grouped(before.toolCalls)} tool calls).`,
+    }
+  })
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -240,6 +343,7 @@ export const register: Register = on => {
     const r = await read($, recent)
     const at = Math.max(await read($, now), s.startedAt)
     const expanded = await read($, isExpanded)
+    const lt = await read($, lifetime)
     const { Box, Text, Button } = $.ui.resolve(e)
 
     const cols = e.props.bodyColumns
@@ -297,6 +401,9 @@ export const register: Register = on => {
       lines.push(
         <Text dimColor wrap="truncate-end">
           {topTools(s)}
+        </Text>,
+        <Text dimColor wrap="truncate-end">
+          {lifetimeText(lt)}
         </Text>,
       )
     }
