@@ -20,6 +20,16 @@ export type Stats = {
   startedAt: number
 }
 
+/** Totals across every session, persisted in $.store and mirrored here. */
+export type Lifetime = {
+  prompts: number
+  toolCalls: number
+  failures: number
+  byTool: Readonly<Record<string, number>>
+  /** When counting began (first run, or the last /pulse-reset), ms since epoch. */
+  since: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'pulse-bar': {
@@ -30,6 +40,7 @@ declare module 'claude-code' {
       /** The clock as of the last tick; drawing reads it so elapsed times move. */
       now: number
       isExpanded: boolean
+      lifetime: Lifetime
     }
   }
 }
